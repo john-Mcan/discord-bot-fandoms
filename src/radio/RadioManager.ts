@@ -5,6 +5,7 @@ import {
   VoiceConnectionStatus,
   createAudioPlayer,
   createAudioResource,
+  entersState,
   joinVoiceChannel,
   type AudioPlayer,
   type VoiceConnection,
@@ -55,9 +56,17 @@ type SendableChannel = {
   send: (options: { content: string }) => Promise<unknown>;
 };
 
+type VoiceNetworkingEmitter = {
+  on?: (event: "stateChange", listener: (oldState: unknown, newState: unknown) => void) => void;
+  off?: (event: "stateChange", listener: (oldState: unknown, newState: unknown) => void) => void;
+};
+
 const PRESENCE_TITLE_MAX = 128;
 const STREAM_OPEN_TIMEOUT_MS = 20_000;
 const MAX_REDIRECTS = 5;
+const READY_REJOIN_WINDOW_MS = 10_000;
+const READY_MAX_REJOINS = 3;
+const AUDIO_HIGH_WATER_MARK = 128 * 1024;
 
 function log(...args: unknown[]): void {
   const ts = new Date().toISOString().slice(11, 23);
@@ -71,7 +80,7 @@ class IcyDemuxer extends Transform {
   private metadataParts: Buffer[] = [];
 
   constructor(private metaint: number) {
-    super();
+    super({ highWaterMark: AUDIO_HIGH_WATER_MARK });
     this.remainingAudio = metaint;
     log("[IcyDemuxer] creado con metaint:", metaint);
   }
@@ -299,9 +308,43 @@ export class RadioManager {
       stopping: false,
     };
 
+    const networkStateChangeHandler = (
+      _oldNetworkState: unknown,
+      newNetworkState: unknown,
+    ) => {
+      const udp = Reflect.get(
+        newNetworkState as Record<string, unknown>,
+        "udp",
+      ) as { keepAliveInterval?: NodeJS.Timeout } | undefined;
+
+      if (udp?.keepAliveInterval) {
+        clearInterval(udp.keepAliveInterval);
+      }
+    };
+
     // Escuchar cambios de estado de la conexión
     connection.on("stateChange", (oldState, newState) => {
+      const oldNetworking = Reflect.get(
+        oldState as unknown as Record<string, unknown>,
+        "networking",
+      ) as VoiceNetworkingEmitter | undefined;
+      const newNetworking = Reflect.get(
+        newState as unknown as Record<string, unknown>,
+        "networking",
+      ) as VoiceNetworkingEmitter | undefined;
+
+      oldNetworking?.off?.("stateChange", networkStateChangeHandler);
+      newNetworking?.on?.("stateChange", networkStateChangeHandler);
+
       log("[connection] stateChange:", oldState.status, "->", newState.status);
+
+      if (
+        oldState.status === VoiceConnectionStatus.Ready &&
+        newState.status === VoiceConnectionStatus.Connecting
+      ) {
+        log("[connection] Ready -> Connecting, forzando reconfiguración...");
+        this.forceConfigureNetworking(connection);
+      }
 
       // Si la conexión fue destruida externamente (ej: alguien desconectó al bot)
       if (newState.status === VoiceConnectionStatus.Destroyed) {
@@ -374,46 +417,64 @@ export class RadioManager {
     connection: VoiceConnection,
     timeoutMs: number,
   ): Promise<boolean> {
-    // Si ya está Ready, retornar inmediatamente
     if (connection.state.status === VoiceConnectionStatus.Ready) {
       log("[waitForConnectionReady] ya está Ready");
       return true;
     }
 
-    // Si está Destroyed o es un estado terminal malo, fallar
     if (connection.state.status === VoiceConnectionStatus.Destroyed) {
       log("[waitForConnectionReady] conexión destruida");
       return false;
     }
 
-    return new Promise<boolean>((resolve) => {
-      const timeout = setTimeout(() => {
-        log("[waitForConnectionReady] timeout esperando Ready");
-        cleanup();
-        resolve(false);
-      }, timeoutMs);
+    const startedAt = Date.now();
+    let rejoinAttempts = 0;
 
-      const onStateChange = (
-        _oldState: { status: VoiceConnectionStatus },
-        newState: { status: VoiceConnectionStatus },
-      ) => {
-        log("[waitForConnectionReady] state:", newState.status);
-        if (newState.status === VoiceConnectionStatus.Ready) {
-          cleanup();
-          resolve(true);
-        } else if (newState.status === VoiceConnectionStatus.Destroyed) {
-          cleanup();
-          resolve(false);
+    while (Date.now() - startedAt < timeoutMs) {
+      const elapsed = Date.now() - startedAt;
+      const remaining = timeoutMs - elapsed;
+      const waitWindow = Math.min(READY_REJOIN_WINDOW_MS, remaining);
+
+      try {
+        await entersState(connection, VoiceConnectionStatus.Ready, waitWindow);
+        log("[waitForConnectionReady] estado Ready");
+        return true;
+      } catch {
+        const status = connection.state.status;
+
+        if (rejoinAttempts >= READY_MAX_REJOINS) {
+          break;
         }
-      };
 
-      const cleanup = () => {
-        clearTimeout(timeout);
-        connection.off("stateChange", onStateChange);
-      };
+        rejoinAttempts += 1;
+        log(`[waitForConnectionReady] rejoin ${rejoinAttempts}/${READY_MAX_REJOINS} (estado: ${status})`);
 
-      connection.on("stateChange", onStateChange);
-    });
+        try {
+          connection.rejoin();
+          this.forceConfigureNetworking(connection);
+        } catch (err) {
+          log("[waitForConnectionReady] error en rejoin:", err instanceof Error ? err.message : String(err));
+          return false;
+        }
+      }
+    }
+
+    log("[waitForConnectionReady] timeout esperando Ready");
+    return false;
+  }
+
+  private forceConfigureNetworking(connection: VoiceConnection): void {
+    try {
+      const maybeConfigure = Reflect.get(
+        connection as unknown as Record<string, unknown>,
+        "configureNetworking",
+      );
+      if (typeof maybeConfigure === "function") {
+        maybeConfigure.call(connection);
+      }
+    } catch (err) {
+      log("[forceConfigureNetworking] error:", err instanceof Error ? err.message : String(err));
+    }
   }
 
   private async startOrReplaceStream(session: GuildSession): Promise<void> {
@@ -454,9 +515,9 @@ export class RadioManager {
         try {
           const parsed = icy.parse(metadata);
           const title = (parsed.StreamTitle ?? "").trim();
-          log("[metadata] título:", title || "(vacío)");
           if (!title) return;
           if (title === session.currentTitle) return;
+          log("[metadata] título:", title);
           session.currentTitle = title;
           this.setPresenceThrottled(title);
         } catch (e) {
@@ -465,11 +526,9 @@ export class RadioManager {
       });
     }
 
-    // Crear el recurso de audio
     log("[startOrReplaceStream] creando AudioResource...");
 
-    // Usamos un PassThrough para evitar que el stream se cierre prematuramente
-    const audioPassThrough = new PassThrough();
+    const audioPassThrough = new PassThrough({ highWaterMark: AUDIO_HIGH_WATER_MARK });
 
     icyHandle.audioStream.on("error", (err) => {
       log("[audioStream] error:", err.message);

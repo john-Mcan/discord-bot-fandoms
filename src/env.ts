@@ -24,7 +24,6 @@ function optionalEnv(name: string): string | null {
 export const env = {
   DISCORD_TOKEN: requiredEnv("DISCORD_TOKEN"),
   DISCORD_CLIENT_ID: requiredEnv("DISCORD_CLIENT_ID"),
-  DEV_GUILD_ID: requiredEnv("DEV_GUILD_ID"),
   IDLE_DISCONNECT_MINUTES: numberEnv("IDLE_DISCONNECT_MINUTES", 5),
 };
 

@@ -101,7 +101,7 @@ type SendableChannel = {
 
 export type RadioManagerConfig = {
   streamUrl: string;
-  stationName: string;
+  stationName: string | null;
   idleDisconnectMinutes: number;
   metadataUrl: string | null;
   metadataTitlePath: string | null;
@@ -412,7 +412,7 @@ export class RadioManager {
       if (this.sessions.get(guild.id) !== session || session.status !== "playing") {
         throw new Error("La sesion termino antes de iniciar la reproduccion");
       }
-      await interaction.editReply(`Reproduciendo **${this.config.stationName}** en **${voiceChannel.name}**.`);
+      await interaction.editReply(`Reproduciendo **${session.stationName}** en **${voiceChannel.name}**.`);
       await this.publishPersistentNowPlaying(session, true);
       this.requestIdleRefresh(session);
     } catch (error) {
@@ -560,7 +560,7 @@ export class RadioManager {
       streamGeneration: 0,
       currentTitle: null,
       currentArtworkUrl: null,
-      stationName: this.config.stationName,
+      stationName: this.config.stationName ?? "Radio",
       metadataSource: null,
       metadataUpdatedAt: 0,
       idleGeneration: 0,
@@ -754,7 +754,10 @@ export class RadioManager {
     }
     session.icy = handle;
     session.lastAudioAt = Date.now();
-    session.stationName = headerValue(handle.res.headers["icy-name"]) ?? this.config.stationName;
+    session.stationName =
+      this.config.stationName ??
+      headerValue(handle.res.headers["icy-name"]) ??
+      "Radio";
 
     if (handle.demuxer) {
       handle.demuxer.on("metadata", (metadata: Buffer) => {
@@ -1078,7 +1081,7 @@ export class RadioManager {
       .setTitle(session.stationName)
       .setDescription(
         session.currentTitle
-          ? `▶️ **Sonando ahora**\n${session.currentTitle}`
+          ? `Sonando ahora\n▶️ **${session.currentTitle}**`
           : "_Esperando información de la canción..._",
       )
       .addFields(

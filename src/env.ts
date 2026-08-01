@@ -49,7 +49,7 @@ export const env = {
   DISCORD_CLIENT_ID: requiredString("DISCORD_CLIENT_ID"),
   DEV_GUILD_ID: optionalString("DEV_GUILD_ID"),
   RADIO_STREAM_URL: httpUrlEnv("RADIO_STREAM_URL", true) as string,
-  RADIO_NAME: optionalString("RADIO_NAME") ?? "Radio",
+  RADIO_NAME: optionalString("RADIO_NAME"),
   RADIO_METADATA_URL: httpUrlEnv("RADIO_METADATA_URL", false),
   RADIO_METADATA_TITLE_PATH: optionalString("RADIO_METADATA_TITLE_PATH"),
   RADIO_METADATA_ARTIST_PATH: optionalString("RADIO_METADATA_ARTIST_PATH"),

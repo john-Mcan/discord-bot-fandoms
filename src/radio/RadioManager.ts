@@ -1058,6 +1058,7 @@ export class RadioManager {
   }
 
   private async publishPersistentNowPlaying(session: GuildSession, create: boolean): Promise<void> {
+    const metadataUpdatedAt = session.metadataUpdatedAt;
     const embed = await this.buildNowPlayingEmbed(session);
     if (session.nowPlayingMessage) {
       await session.nowPlayingMessage.edit({ embeds: [embed] }).catch((error: unknown) => {
@@ -1072,6 +1073,12 @@ export class RadioManager {
     session.nowPlayingMessage = await channel
       .send({ embeds: [embed], allowedMentions: { parse: [] } })
       .catch(() => undefined);
+    if (
+      session.nowPlayingMessage &&
+      session.metadataUpdatedAt !== metadataUpdatedAt
+    ) {
+      this.schedulePersistentNowPlayingUpdate(session);
+    }
   }
 
   private async buildNowPlayingEmbed(session: GuildSession): Promise<EmbedBuilder> {

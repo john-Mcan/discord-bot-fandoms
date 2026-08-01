@@ -1075,16 +1075,20 @@ export class RadioManager {
     const listeners = await this.humanListenerCount(session);
     const embed = new EmbedBuilder()
       .setColor(session.status === "playing" ? 0x2ecc71 : 0xf39c12)
-      .setTitle(`🎵 ${session.stationName}`)
+      .setTitle(session.stationName)
       .setDescription(
         session.currentTitle
-          ? `**Sonando ahora**\n${session.currentTitle}`
+          ? `▶️ **Sonando ahora**\n${session.currentTitle}`
           : "_Esperando información de la canción..._",
       )
       .addFields(
-        { name: "🔊 Estado", value: this.statusLabel(session.status), inline: true },
-        { name: "📍 Canal", value: `<#${session.voiceChannelId}>`, inline: true },
-        { name: "👥 Oyentes", value: String(listeners), inline: true },
+        {
+          name: "Estado",
+          value: session.status === "playing" ? "Activo" : this.statusLabel(session.status),
+          inline: true,
+        },
+        { name: "Canal", value: `<#${session.voiceChannelId}>`, inline: true },
+        { name: "Oyentes", value: String(listeners), inline: true },
       )
       .setFooter({
         text: session.metadataSource

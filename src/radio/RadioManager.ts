@@ -70,6 +70,7 @@ type GuildSession = {
   icy?: IcyHandle;
   streamGeneration: number;
   currentTitle: string | null;
+  currentArtworkUrl: string | null;
   stationName: string;
   metadataSource: MetadataSource;
   metadataUpdatedAt: number;
@@ -105,6 +106,7 @@ export type RadioManagerConfig = {
   metadataUrl: string | null;
   metadataTitlePath: string | null;
   metadataArtistPath: string | null;
+  metadataArtworkPath: string | null;
   metadataPollSeconds: number;
 };
 
@@ -184,6 +186,40 @@ export function extractMetadataTitle(
     return title.value;
   }
   return `${artist.value} — ${title.value}`;
+}
+
+export function extractMetadataArtwork(
+  payload: unknown,
+  artworkPath: string | null,
+): string | null {
+  const artwork = firstString(payload, [
+    ...(artworkPath ? [artworkPath] : []),
+    "now_playing.song.art",
+    "song.art",
+    "current.art",
+    "data.art",
+    "art",
+    "artwork",
+    "cover",
+  ]);
+  if (!artwork) return null;
+  try {
+    const url = new URL(artwork.value);
+    return url.protocol === "http:" || url.protocol === "https:" ? url.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
+export function inferAzuraCastMetadataUrl(streamUrl: string): string | null {
+  try {
+    const url = new URL(streamUrl);
+    const match = url.pathname.match(/^\/listen\/([^/]+)\//);
+    if (!match?.[1]) return null;
+    return new URL(`/api/nowplaying/${match[1]}`, url.origin).toString();
+  } catch {
+    return null;
+  }
 }
 
 export function parseIcyMetadata(metadata: Buffer): string | null {
@@ -266,11 +302,14 @@ export class RadioManager {
   private publishedPresenceTitle: string | null = null;
   private lastPresenceAt = 0;
   private presenceTimer?: NodeJS.Timeout;
+  private readonly metadataUrl: string | null;
 
   constructor(
     private readonly client: Client,
     private readonly config: RadioManagerConfig,
-  ) {}
+  ) {
+    this.metadataUrl = config.metadataUrl ?? inferAzuraCastMetadataUrl(config.streamUrl);
+  }
 
   public recordCommand(command: string): void {
     this.commandCounts.set(command, (this.commandCounts.get(command) ?? 0) + 1);
@@ -448,6 +487,18 @@ export class RadioManager {
     const session = this.sessions.get(newState.guild.id);
     if (!session || session.stopping) return;
     if (
+      newState.id === this.client.user?.id &&
+      oldState.channelId === session.voiceChannelId &&
+      newState.channelId !== session.voiceChannelId
+    ) {
+      logger.info("voice.bot_removed", {
+        ...sessionContext(session),
+        nextVoiceChannelId: newState.channelId,
+      });
+      void this.stopSession(session, "manual_disconnect");
+      return;
+    }
+    if (
       oldState.channelId === session.voiceChannelId ||
       newState.channelId === session.voiceChannelId
     ) {
@@ -508,6 +559,7 @@ export class RadioManager {
       player,
       streamGeneration: 0,
       currentTitle: null,
+      currentArtworkUrl: null,
       stationName: this.config.stationName,
       metadataSource: null,
       metadataUpdatedAt: 0,
@@ -537,7 +589,17 @@ export class RadioManager {
       if (newState.status === VoiceConnectionStatus.Destroyed) {
         void this.stopSession(session, "connection_destroyed");
       } else if (newState.status === VoiceConnectionStatus.Disconnected) {
-        void this.ensurePlayback(session, "voice_disconnected", false).catch(() => null);
+        queueMicrotask(() => {
+          if (session.stopping || this.sessions.get(session.guildId) !== session) return;
+          const guild = this.client.guilds.cache.get(session.guildId);
+          const botId = this.client.user?.id;
+          const botChannelId = botId ? guild?.voiceStates.cache.get(botId)?.channelId : undefined;
+          if (session.status === "playing" && botChannelId !== session.voiceChannelId) {
+            void this.stopSession(session, "manual_disconnect");
+            return;
+          }
+          void this.ensurePlayback(session, "voice_disconnected", false).catch(() => null);
+        });
       }
     });
     session.connection.on("error", (error) => {
@@ -709,7 +771,7 @@ export class RadioManager {
       });
     }
 
-    if (this.config.metadataUrl) this.startMetadataPolling(session, generation);
+    if (this.metadataUrl) this.startMetadataPolling(session, generation);
 
     const passThrough = new PassThrough({ highWaterMark: AUDIO_HIGH_WATER_MARK });
     passThrough.on("data", () => {
@@ -742,13 +804,9 @@ export class RadioManager {
   private startMetadataPolling(session: GuildSession, generation: number): void {
     if (session.metadataTimer) clearInterval(session.metadataTimer);
     const poll = async () => {
-      if (session.stopping || generation !== session.streamGeneration || !this.config.metadataUrl) return;
-      const icyIsFresh =
-        session.metadataSource === "icy" &&
-        Date.now() - session.metadataUpdatedAt < this.config.metadataPollSeconds * 2_000;
-      if (icyIsFresh) return;
+      if (session.stopping || generation !== session.streamGeneration || !this.metadataUrl) return;
       try {
-        const response = await fetch(this.config.metadataUrl, {
+        const response = await fetch(this.metadataUrl, {
           headers: { Accept: "application/json", "User-Agent": "monkey-bot/0.2" },
           signal: AbortSignal.timeout(10_000),
         });
@@ -761,7 +819,8 @@ export class RadioManager {
           this.config.metadataTitlePath,
           this.config.metadataArtistPath,
         );
-        if (title) this.handleMetadata(session, title, "json");
+        const artworkUrl = extractMetadataArtwork(payload, this.config.metadataArtworkPath);
+        if (title) this.handleMetadata(session, title, "json", artworkUrl);
       } catch (error) {
         logger.warn("metadata.poll_failed", {
           ...sessionContext(session),
@@ -773,14 +832,36 @@ export class RadioManager {
     session.metadataTimer = setInterval(() => void poll(), this.config.metadataPollSeconds * 1000);
   }
 
-  private handleMetadata(session: GuildSession, rawTitle: string, source: Exclude<MetadataSource, null>): void {
+  private handleMetadata(
+    session: GuildSession,
+    rawTitle: string,
+    source: Exclude<MetadataSource, null>,
+    artworkUrl?: string | null,
+  ): void {
     const title = rawTitle.replace(/\0/g, "").trim().slice(0, 300);
-    if (!title || title === session.currentTitle) return;
+    if (!title) return;
+    if (
+      source === "icy" &&
+      session.metadataSource === "json" &&
+      Date.now() - session.metadataUpdatedAt < this.config.metadataPollSeconds * 2_000
+    ) return;
+    const titleChanged = title !== session.currentTitle;
+    const artworkChanged = artworkUrl !== undefined && artworkUrl !== session.currentArtworkUrl;
+    if (!titleChanged && !artworkChanged && source === session.metadataSource) {
+      if (source === "json") session.metadataUpdatedAt = Date.now();
+      return;
+    }
     session.currentTitle = title;
+    if (artworkUrl !== undefined) session.currentArtworkUrl = artworkUrl;
     session.metadataSource = source;
     session.metadataUpdatedAt = Date.now();
     this.metadataUpdates += 1;
-    logger.info("metadata.updated", { ...sessionContext(session), source, title });
+    logger.info("metadata.updated", {
+      ...sessionContext(session),
+      source,
+      title,
+      hasArtwork: Boolean(session.currentArtworkUrl),
+    });
     this.schedulePresence(title);
     this.schedulePersistentNowPlayingUpdate(session);
   }
@@ -823,7 +904,7 @@ export class RadioManager {
     this.pendingPresenceTitle = null;
     this.publishedPresenceTitle = null;
     this.client.user?.setPresence({
-      activities: [{ name: "usa /play", type: ActivityType.Playing }],
+      activities: [{ name: "dale /play a NEX!", type: ActivityType.Playing }],
       status: "online",
     });
   }
@@ -992,17 +1073,27 @@ export class RadioManager {
 
   private async buildNowPlayingEmbed(session: GuildSession): Promise<EmbedBuilder> {
     const listeners = await this.humanListenerCount(session);
-    return new EmbedBuilder()
+    const embed = new EmbedBuilder()
       .setColor(session.status === "playing" ? 0x2ecc71 : 0xf39c12)
-      .setTitle(session.stationName)
-      .setDescription(session.currentTitle ? `🎵 **${session.currentTitle}**` : "Metadata no disponible")
-      .addFields(
-        { name: "Estado", value: this.statusLabel(session.status), inline: true },
-        { name: "Canal", value: `<#${session.voiceChannelId}>`, inline: true },
-        { name: "Oyentes", value: String(listeners), inline: true },
+      .setTitle(`🎵 ${session.stationName}`)
+      .setDescription(
+        session.currentTitle
+          ? `**Sonando ahora**\n${session.currentTitle}`
+          : "_Esperando información de la canción..._",
       )
-      .setFooter({ text: session.metadataSource ? `Metadata: ${session.metadataSource.toUpperCase()}` : "Esperando metadata" })
+      .addFields(
+        { name: "🔊 Estado", value: this.statusLabel(session.status), inline: true },
+        { name: "📍 Canal", value: `<#${session.voiceChannelId}>`, inline: true },
+        { name: "👥 Oyentes", value: String(listeners), inline: true },
+      )
+      .setFooter({
+        text: session.metadataSource
+          ? `Actualizado desde ${session.metadataSource.toUpperCase()}`
+          : "Esperando metadata",
+      })
       .setTimestamp();
+    if (session.currentArtworkUrl) embed.setThumbnail(session.currentArtworkUrl);
+    return embed;
   }
 
   private async updatePersistentAsStopped(session: GuildSession, reason: string): Promise<void> {
@@ -1012,8 +1103,9 @@ export class RadioManager {
       .setTitle(session.stationName)
       .setDescription(session.currentTitle ? `Ultima cancion: **${session.currentTitle}**` : "Radio detenida")
       .addFields({ name: "Estado", value: "Desconectada", inline: true })
-      .setFooter({ text: `Motivo: ${reason}` })
+      .setFooter({ text: `Motivo: ${this.stopReasonLabel(reason)}` })
       .setTimestamp();
+    if (session.currentArtworkUrl) embed.setThumbnail(session.currentArtworkUrl);
     await session.nowPlayingMessage.edit({ embeds: [embed] }).catch(() => null);
   }
 
@@ -1099,6 +1191,18 @@ export class RadioManager {
       stopping: "Desconectando",
       stopped: "Desconectada",
     }[status];
+  }
+
+  private stopReasonLabel(reason: string): string {
+    return {
+      command: "comando /stop",
+      manual_disconnect: "desconexión manual desde Discord",
+      idle_timeout: "canal sin oyentes",
+      retries_exhausted: "fallos de conexión",
+      shutdown: "apagado del bot",
+      replaced: "sesión trasladada",
+      connection_destroyed: "conexión cerrada",
+    }[reason] ?? reason;
   }
 
   private connectionIsDestroyed(connection: VoiceConnection): boolean {

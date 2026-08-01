@@ -6,7 +6,9 @@ import type { Client } from "discord.js";
 import { HealthServer } from "../src/health";
 import {
   IcyDemuxer,
+  extractMetadataArtwork,
   extractMetadataTitle,
+  inferAzuraCastMetadataUrl,
   parseIcyMetadata,
   readPath,
 } from "../src/radio/RadioManager";
@@ -65,6 +67,25 @@ test("extractMetadataTitle soporta payload AzuraCast y paths configurables", () 
 test("extractMetadataTitle no duplica el artista si ya viene incluido", () => {
   const payload = { title: "Artist - Track", artist: "Artist" };
   assert.equal(extractMetadataTitle(payload, null, null), "Artist - Track");
+});
+
+test("extrae portada de AzuraCast y rechaza URLs no web", () => {
+  const payload = {
+    now_playing: { song: { art: "https://radio.example/art/song.jpg" } },
+  };
+  assert.equal(
+    extractMetadataArtwork(payload, null),
+    "https://radio.example/art/song.jpg",
+  );
+  assert.equal(extractMetadataArtwork({ art: "javascript:alert(1)" }, null), null);
+});
+
+test("infiere el endpoint de metadata para streams AzuraCast", () => {
+  assert.equal(
+    inferAzuraCastMetadataUrl("https://stream.example/listen/my-radio/radio.mp3"),
+    "https://stream.example/api/nowplaying/my-radio",
+  );
+  assert.equal(inferAzuraCastMetadataUrl("https://stream.example/live.mp3"), null);
 });
 
 test("parseIcyMetadata conserva apostrofes y elimina padding", () => {

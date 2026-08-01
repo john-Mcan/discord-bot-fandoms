@@ -18,6 +18,7 @@ const radio = new RadioManager(client, {
   metadataUrl: env.RADIO_METADATA_URL,
   metadataTitlePath: env.RADIO_METADATA_TITLE_PATH,
   metadataArtistPath: env.RADIO_METADATA_ARTIST_PATH,
+  metadataArtworkPath: env.RADIO_METADATA_ARTWORK_PATH,
   metadataPollSeconds: env.METADATA_POLL_SECONDS,
 });
 const health = new HealthServer(client, radio, env.HEALTH_HOST, env.HEALTH_PORT);

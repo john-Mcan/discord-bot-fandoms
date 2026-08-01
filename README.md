@@ -48,11 +48,12 @@ Si `DEV_GUILD_ID` está configurado, `deploy:commands` registra los comandos sol
 | `RADIO_METADATA_URL` | Endpoint JSON alternativo | Deshabilitado |
 | `RADIO_METADATA_TITLE_PATH` | Ruta por puntos al título | Autodetección |
 | `RADIO_METADATA_ARTIST_PATH` | Ruta por puntos al artista | Autodetección |
+| `RADIO_METADATA_ARTWORK_PATH` | Ruta por puntos a la portada | `now_playing.song.art` |
 | `METADATA_POLL_SECONDS` | Intervalo del endpoint JSON | `15` |
 | `HEALTH_HOST` | Interfaz del healthcheck | `127.0.0.1` |
 | `HEALTH_PORT` | Puerto; `0` lo deshabilita | `3000` |
 
-El extractor JSON reconoce automáticamente formatos comunes, incluido AzuraCast (`now_playing.song.title` y `now_playing.song.artist`). Los paths configurables permiten usar otros proveedores sin cambiar código.
+El extractor JSON reconoce automáticamente formatos comunes, incluido AzuraCast (`now_playing.song.title`, `now_playing.song.artist` y `now_playing.song.art`). Para streams AzuraCast con ruta `/listen/<estación>/...`, el bot descubre automáticamente el endpoint `/api/nowplaying/<estación>`. Los paths configurables permiten usar otros proveedores sin cambiar código.
 
 ## Comandos
 

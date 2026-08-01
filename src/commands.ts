@@ -8,7 +8,30 @@ const radioCommand = new SlashCommandBuilder()
   .setName("radio")
   .setDescription("Alias de /play (reproduce la radio configurada)");
 
-export const commands = [playCommand, radioCommand];
+const stopCommand = new SlashCommandBuilder()
+  .setName("stop")
+  .setDescription("Detiene la radio y desconecta el bot");
+
+const leaveCommand = new SlashCommandBuilder()
+  .setName("leave")
+  .setDescription("Alias de /stop (desconecta el bot)");
+
+const nowPlayingCommand = new SlashCommandBuilder()
+  .setName("nowplaying")
+  .setDescription("Muestra la cancion que esta sonando");
+
+const statusCommand = new SlashCommandBuilder()
+  .setName("status")
+  .setDescription("Muestra el estado de la radio y la conexion");
+
+export const commands = [
+  playCommand,
+  radioCommand,
+  stopCommand,
+  leaveCommand,
+  nowPlayingCommand,
+  statusCommand,
+];
 export const commandsJson = commands.map((c) => c.toJSON());
 
 

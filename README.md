@@ -1,133 +1,85 @@
-# 🎵 Bot Radio DS
+# Bot Radio DS
 
-Bot de Discord para reproducir streams de radio en canales de voz. Desarrollado en TypeScript con discord.js y @discordjs/voice.
+Bot de Discord para reproducir una radio online en canales de voz. Está construido con TypeScript, `discord.js`, `@discordjs/voice` y FFmpeg.
 
-## Características
+## Funciones
 
-- **Comandos slash** (`/play`, `/radio`) para invocar al bot
-- **Reproducción de streams** MP3/AAC desde URLs configuradas
-- **Metadata ICY** - Muestra el título de la canción actual en el estado del bot
-- **Auto-desconexión** - Se desconecta si el canal queda vacío por X minutos
-- **Reconexión automática** - Reintenta si el stream falla
-- **Mensajes de contexto** - Informa en el canal de texto sobre el estado de reproducción
+- Reproducción de streams MP3/AAC por HTTP o HTTPS.
+- Metadata ICY y fallback mediante endpoint JSON.
+- Mensaje persistente y comando para la canción actual.
+- Reconexión serializada con backoff exponencial.
+- Desconexión automática cuando el canal queda vacío.
+- Protección para que otros usuarios no trasladen una sesión con oyentes.
+- Cooldown de comandos.
+- Logs JSON estructurados.
+- Healthcheck JSON y métricas Prometheus.
 
 ## Requisitos
 
-- Node.js 18+
-- Token de bot de Discord con permisos de voz
-- FFmpeg (incluido vía `ffmpeg-static`)
+- Node.js 22.12 o superior.
+- Token de un bot de Discord.
+- Permisos `View Channel`, `Connect` y `Speak` en el canal de voz.
+
+FFmpeg se instala mediante `ffmpeg-static`; no se necesita una instalación global.
 
 ## Instalación
 
 ```bash
 npm install
-```
-
-## Configuración
-
-Crea un archivo `.env` en la raíz del proyecto:
-
-```env
-# Obligatorias
-DISCORD_TOKEN=tu_token_de_discord
-DISCORD_CLIENT_ID=tu_client_id
-DEV_GUILD_ID=id_del_servidor_de_desarrollo
-RADIO_STREAM_URL=https://tu-stream-de-radio.com/stream.mp3
-
-# Opcionales
-IDLE_DISCONNECT_MINUTES=5
-```
-
-### Variables de entorno
-
-| Variable | Descripción | Requerida |
-|----------|-------------|-----------|
-| `DISCORD_TOKEN` | Token del bot de Discord | ✅ |
-| `DISCORD_CLIENT_ID` | Client ID de la aplicación de Discord | ✅ |
-| `DEV_GUILD_ID` | ID del servidor donde se registran los comandos | ✅ |
-| `RADIO_STREAM_URL` | URL del stream de radio a reproducir | ✅ |
-| `IDLE_DISCONNECT_MINUTES` | Minutos antes de desconectarse si no hay usuarios (default: 5) | ❌ |
-
-## Uso
-
-### Registrar comandos slash
-
-```bash
+copy .env.example .env
 npm run deploy:commands
-```
-
-### Desarrollo
-
-```bash
-npm run dev
-```
-
-### Producción
-
-```bash
 npm run build
 npm start
 ```
 
-## Comandos de Discord
+Si `DEV_GUILD_ID` está configurado, `deploy:commands` registra los comandos solo en ese servidor y aparecen inmediatamente. Sin esa variable se registran globalmente.
+
+## Variables de entorno
+
+| Variable | Uso | Valor predeterminado |
+|---|---|---|
+| `DISCORD_TOKEN` | Token del bot | Obligatoria |
+| `DISCORD_CLIENT_ID` | ID de la aplicación | Obligatoria |
+| `RADIO_STREAM_URL` | Stream HTTP/HTTPS | Obligatoria |
+| `DEV_GUILD_ID` | Registro rápido de comandos en desarrollo | Global |
+| `RADIO_NAME` | Nombre mostrado en embeds | `Radio` |
+| `IDLE_DISCONNECT_MINUTES` | Tiempo con cero oyentes | `5` |
+| `COMMAND_COOLDOWN_SECONDS` | Cooldown por usuario y comando | `3` |
+| `RADIO_METADATA_URL` | Endpoint JSON alternativo | Deshabilitado |
+| `RADIO_METADATA_TITLE_PATH` | Ruta por puntos al título | Autodetección |
+| `RADIO_METADATA_ARTIST_PATH` | Ruta por puntos al artista | Autodetección |
+| `METADATA_POLL_SECONDS` | Intervalo del endpoint JSON | `15` |
+| `HEALTH_HOST` | Interfaz del healthcheck | `127.0.0.1` |
+| `HEALTH_PORT` | Puerto; `0` lo deshabilita | `3000` |
+
+El extractor JSON reconoce automáticamente formatos comunes, incluido AzuraCast (`now_playing.song.title` y `now_playing.song.artist`). Los paths configurables permiten usar otros proveedores sin cambiar código.
+
+## Comandos
 
 | Comando | Descripción |
-|---------|-------------|
-| `/play` | Une al bot a tu canal de voz y reproduce la radio |
-| `/radio` | Alias de `/play` |
+|---|---|
+| `/play`, `/radio` | Conecta el bot y reproduce la radio |
+| `/stop`, `/leave` | Detiene y desconecta el bot |
+| `/nowplaying` | Muestra la canción y sesión actuales |
+| `/status` | Muestra canal, oyentes, uptime, ping y reintentos |
 
-## Estructura del proyecto
+Un usuario no puede mover el bot a otro canal mientras haya oyentes, salvo que tenga el permiso `Move Members`. Los canales Stage se rechazan explícitamente; se requiere un canal de voz normal.
 
+## Operación
+
+- `GET /healthz`: estado JSON del cliente y las sesiones.
+- `GET /metrics`: métricas en formato Prometheus.
+- Los logs se escriben como un objeto JSON por línea e incluyen `sessionId`, `guildId` y `voiceChannelId` cuando corresponde.
+
+## Desarrollo
+
+```bash
+npm run dev
+npm test
+npm run build
+npm audit
 ```
-monkey-bot/
-├── src/
-│   ├── index.ts              # Punto de entrada
-│   ├── env.ts                # Configuración de variables de entorno
-│   ├── commands.ts           # Definición de comandos slash
-│   ├── deploy-commands.ts    # Script para registrar comandos
-│   ├── radio/
-│   │   └── RadioManager.ts   # Lógica de reproducción y voz
-│   └── types/
-│       └── icy.d.ts          # Tipos para la librería icy
-├── dist/                     # Código compilado
-├── package.json
-├── tsconfig.json
-└── .env
-```
-
-## Tecnologías
-
-- **TypeScript** - Lenguaje de programación
-- **discord.js** - Librería para interactuar con la API de Discord
-- **@discordjs/voice** - Conexiones de voz de Discord
-- **@discordjs/opus** - Codificación de audio Opus
-- **ffmpeg-static** - FFmpeg embebido para transcoding
-- **icy** - Parser de metadata ICY para streams de radio
-
----
 
 ## Licencia
 
-**© 2026 - Todos los derechos reservados**
-
-Este proyecto se proporciona **únicamente con fines educativos y de aprendizaje**.
-
-### Términos de uso
-
-✅ **Permitido:**
-- Estudiar el código fuente para aprender
-- Usar como referencia educativa
-- Ejecutar localmente para propósitos de aprendizaje personal
-
-❌ **Prohibido:**
-- Copiar, redistribuir o publicar el código sin autorización expresa
-- Usar el código en proyectos comerciales o públicos
-- Crear trabajos derivados sin permiso del autor
-- Remover o modificar este aviso de licencia
-
-Para solicitar permisos de uso, contacta al autor: contacto@johnmcan.dev
-
----
-
-*Bot Radio DS - Proyecto educativo*
-
+© 2026. Todos los derechos reservados. Proyecto proporcionado con fines educativos y de aprendizaje.

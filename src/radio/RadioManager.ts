@@ -8,23 +8,46 @@ import {
   entersState,
   joinVoiceChannel,
   type AudioPlayer,
+  type DiscordGatewayAdapterCreator,
   type VoiceConnection,
 } from "@discordjs/voice";
 import {
   ActivityType,
   ChannelType,
+  EmbedBuilder,
   GuildMember,
   PermissionFlagsBits,
   type ChatInputCommandInteraction,
   type Client,
+  type Message,
   type VoiceState,
 } from "discord.js";
-import icy from "icy";
+import { randomUUID } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import * as http from "node:http";
 import * as https from "node:https";
 import { PassThrough, Transform, type TransformCallback } from "node:stream";
 import type { Readable } from "node:stream";
+import { logger } from "../logger";
+
+const STREAM_OPEN_TIMEOUT_MS = 20_000;
+const PLAYER_START_TIMEOUT_MS = 20_000;
+const CONNECTION_READY_TIMEOUT_MS = 20_000;
+const STREAM_STALL_TIMEOUT_MS = 45_000;
+const STREAM_WATCHDOG_INTERVAL_MS = 15_000;
+const MAX_REDIRECTS = 5;
+const MAX_START_ATTEMPTS = 5;
+const AUDIO_HIGH_WATER_MARK = 128 * 1024;
+const PRESENCE_UPDATE_INTERVAL_MS = 10_000;
+
+type SessionStatus =
+  | "connecting"
+  | "playing"
+  | "reconnecting"
+  | "stopping"
+  | "stopped";
+
+type MetadataSource = "icy" | "json" | null;
 
 type IcyHandle = {
   req: http.ClientRequest;
@@ -34,55 +57,160 @@ type IcyHandle = {
 };
 
 type GuildSession = {
+  id: string;
   guildId: string;
   voiceChannelId: string;
   textChannelId: string;
   streamUrl: string;
-
+  createdAt: number;
+  playbackStartedAt: number | null;
+  status: SessionStatus;
   connection: VoiceConnection;
   player: AudioPlayer;
-
   icy?: IcyHandle;
+  streamGeneration: number;
   currentTitle: string | null;
-
-  restartAttempts: number;
-  lastRetryNoticeAt: number;
-
+  stationName: string;
+  metadataSource: MetadataSource;
+  metadataUpdatedAt: number;
+  metadataTimer?: NodeJS.Timeout;
+  watchdogTimer?: NodeJS.Timeout;
   idleTimer?: NodeJS.Timeout;
+  idleGeneration: number;
+  idleRefreshRequested: boolean;
+  idleRefreshPromise?: Promise<void>;
+  recoveryPromise?: Promise<void>;
+  stopPromise?: Promise<void>;
+  consecutiveFailures: number;
+  totalRetries: number;
+  lastError: string | null;
+  lastAudioAt: number | null;
+  nowPlayingMessage?: Message;
+  nowPlayingUpdateTimer?: NodeJS.Timeout;
   stopping: boolean;
 };
 
 type SendableChannel = {
-  send: (options: { content: string }) => Promise<unknown>;
+  send: (options: {
+    content?: string;
+    embeds?: EmbedBuilder[];
+    allowedMentions?: { parse: never[] };
+  }) => Promise<Message>;
 };
 
-type VoiceNetworkingEmitter = {
-  on?: (event: "stateChange", listener: (oldState: unknown, newState: unknown) => void) => void;
-  off?: (event: "stateChange", listener: (oldState: unknown, newState: unknown) => void) => void;
+export type RadioManagerConfig = {
+  streamUrl: string;
+  stationName: string;
+  idleDisconnectMinutes: number;
+  metadataUrl: string | null;
+  metadataTitlePath: string | null;
+  metadataArtistPath: string | null;
+  metadataPollSeconds: number;
 };
 
-const PRESENCE_TITLE_MAX = 128;
-const STREAM_OPEN_TIMEOUT_MS = 20_000;
-const MAX_REDIRECTS = 5;
-const READY_REJOIN_WINDOW_MS = 10_000;
-const READY_MAX_REJOINS = 3;
-const AUDIO_HIGH_WATER_MARK = 128 * 1024;
+export type RadioMetrics = {
+  sessions: number;
+  playingSessions: number;
+  reconnectingSessions: number;
+  streamFailures: number;
+  totalRetries: number;
+  metadataUpdates: number;
+  commands: Record<string, number>;
+};
 
-function log(...args: unknown[]): void {
-  const ts = new Date().toISOString().slice(11, 23);
-  console.log(`[${ts}]`, ...args);
+function sessionContext(session: GuildSession): Record<string, unknown> {
+  return {
+    sessionId: session.id,
+    guildId: session.guildId,
+    voiceChannelId: session.voiceChannelId,
+    status: session.status,
+  };
 }
 
-class IcyDemuxer extends Transform {
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function headerValue(value: string | string[] | undefined): string | null {
+  if (Array.isArray(value)) return value[0]?.trim() || null;
+  return value?.trim() || null;
+}
+
+export function readPath(value: unknown, path: string): unknown {
+  return path.split(".").reduce<unknown>((current, key) => {
+    if (!current || typeof current !== "object") return undefined;
+    return (current as Record<string, unknown>)[key];
+  }, value);
+}
+
+function firstString(value: unknown, paths: string[]): { value: string; path: string } | null {
+  for (const path of paths) {
+    const candidate = readPath(value, path);
+    if (typeof candidate === "string" && candidate.trim()) {
+      return { value: candidate.trim(), path };
+    }
+  }
+  return null;
+}
+
+export function extractMetadataTitle(
+  payload: unknown,
+  titlePath: string | null,
+  artistPath: string | null,
+): string | null {
+  const titlePaths = [
+    ...(titlePath ? [titlePath] : []),
+    "now_playing.song.title",
+    "song.title",
+    "current.title",
+    "data.title",
+    "title",
+    "now_playing.song.text",
+    "currentSong",
+    "StreamTitle",
+  ];
+  const artistPaths = [
+    ...(artistPath ? [artistPath] : []),
+    "now_playing.song.artist",
+    "song.artist",
+    "current.artist",
+    "data.artist",
+    "artist",
+  ];
+  const title = firstString(payload, titlePaths);
+  if (!title) return null;
+  const artist = firstString(payload, artistPaths);
+  if (!artist || title.value.toLocaleLowerCase().includes(artist.value.toLocaleLowerCase())) {
+    return title.value;
+  }
+  return `${artist.value} — ${title.value}`;
+}
+
+export function parseIcyMetadata(metadata: Buffer): string | null {
+  let text = metadata.toString("utf8");
+  if (text.includes("�")) text = metadata.toString("latin1");
+  text = text.replace(/\0/g, "");
+  const marker = "StreamTitle='";
+  const start = text.indexOf(marker);
+  if (start < 0) return null;
+  const valueStart = start + marker.length;
+  const end = text.indexOf("';", valueStart);
+  const title = text.slice(valueStart, end >= 0 ? end : undefined).trim();
+  return title || null;
+}
+
+export class IcyDemuxer extends Transform {
   private remainingAudio: number;
   private expectingMetadataLength = false;
   private remainingMetadata = 0;
   private metadataParts: Buffer[] = [];
 
-  constructor(private metaint: number) {
+  constructor(private readonly metaint: number) {
     super({ highWaterMark: AUDIO_HIGH_WATER_MARK });
+    if (!Number.isInteger(metaint) || metaint <= 0) {
+      throw new Error("metaint ICY invalido");
+    }
     this.remainingAudio = metaint;
-    log("[IcyDemuxer] creado con metaint:", metaint);
   }
 
   public override _transform(
@@ -92,803 +220,896 @@ class IcyDemuxer extends Transform {
   ): void {
     try {
       let offset = 0;
-
       while (offset < chunk.length) {
         if (this.remainingAudio > 0) {
-          const toCopy = Math.min(this.remainingAudio, chunk.length - offset);
-          this.push(chunk.subarray(offset, offset + toCopy));
-          offset += toCopy;
-          this.remainingAudio -= toCopy;
-
-          if (this.remainingAudio === 0) {
-            this.expectingMetadataLength = true;
-          }
-
+          const length = Math.min(this.remainingAudio, chunk.length - offset);
+          this.push(chunk.subarray(offset, offset + length));
+          offset += length;
+          this.remainingAudio -= length;
+          if (this.remainingAudio === 0) this.expectingMetadataLength = true;
           continue;
         }
 
         if (this.expectingMetadataLength) {
-          const lengthByte = chunk[offset];
+          this.remainingMetadata = chunk[offset] * 16;
           offset += 1;
-          this.remainingMetadata = lengthByte * 16;
           this.expectingMetadataLength = false;
-
-          if (this.remainingMetadata === 0) {
-            this.remainingAudio = this.metaint;
-          } else {
-            this.metadataParts = [];
-          }
-
+          if (this.remainingMetadata === 0) this.remainingAudio = this.metaint;
+          else this.metadataParts = [];
           continue;
         }
 
-        // leyendo metadata
-        const toCopy = Math.min(this.remainingMetadata, chunk.length - offset);
-        this.metadataParts.push(chunk.subarray(offset, offset + toCopy));
-        offset += toCopy;
-        this.remainingMetadata -= toCopy;
-
+        const length = Math.min(this.remainingMetadata, chunk.length - offset);
+        this.metadataParts.push(chunk.subarray(offset, offset + length));
+        offset += length;
+        this.remainingMetadata -= length;
         if (this.remainingMetadata === 0) {
-          const metadata = Buffer.concat(this.metadataParts);
+          this.emit("metadata", Buffer.concat(this.metadataParts));
           this.metadataParts = [];
-          this.emit("metadata", metadata);
           this.remainingAudio = this.metaint;
         }
       }
-
       callback();
-    } catch (err) {
-      callback(err as Error);
+    } catch (error) {
+      callback(error as Error);
     }
   }
 }
 
 export class RadioManager {
-  private sessions = new Map<string, GuildSession>();
+  private readonly sessions = new Map<string, GuildSession>();
+  private readonly commandCounts = new Map<string, number>();
+  private streamFailures = 0;
+  private totalRetries = 0;
+  private metadataUpdates = 0;
+  private pendingPresenceTitle: string | null = null;
+  private publishedPresenceTitle: string | null = null;
   private lastPresenceAt = 0;
-  private lastPresenceTitle: string | null = null;
+  private presenceTimer?: NodeJS.Timeout;
 
   constructor(
-    private client: Client,
-    private idleDisconnectMinutes: number,
+    private readonly client: Client,
+    private readonly config: RadioManagerConfig,
   ) {}
 
-  public async play(
-    interaction: ChatInputCommandInteraction,
-    rawUrl: string,
-  ): Promise<void> {
-    // Defer lo más pronto posible (Discord da solo 3 segundos)
-    try {
-      await interaction.deferReply();
-    } catch (err) {
-      log("[play] deferReply falló (interacción expirada?):", err);
-      return; // No podemos continuar si no podemos responder
-    }
+  public recordCommand(command: string): void {
+    this.commandCounts.set(command, (this.commandCounts.get(command) ?? 0) + 1);
+  }
 
+  public getMetrics(): RadioMetrics {
+    const sessions = [...this.sessions.values()];
+    return {
+      sessions: sessions.length,
+      playingSessions: sessions.filter((session) => session.status === "playing").length,
+      reconnectingSessions: sessions.filter((session) => session.status === "reconnecting").length,
+      streamFailures: this.streamFailures,
+      totalRetries: this.totalRetries,
+      metadataUpdates: this.metadataUpdates,
+      commands: Object.fromEntries(this.commandCounts),
+    };
+  }
+
+  public async play(interaction: ChatInputCommandInteraction): Promise<void> {
+    if (!(await this.defer(interaction))) return;
     const guild = interaction.guild;
     if (!guild) {
+      await interaction.editReply("Este comando solo funciona dentro de un servidor.");
+      return;
+    }
+
+    const member = await this.resolveMember(interaction);
+    const voiceChannel = member?.voice.channel;
+    if (!member || !voiceChannel) {
+      await interaction.editReply("Primero entra a un canal de voz y luego usa `/play`.");
+      return;
+    }
+    if (voiceChannel.type === ChannelType.GuildStageVoice) {
       await interaction.editReply(
-        "Este comando solo funciona dentro de un servidor (no en DM).",
-      ).catch(() => null);
+        "Los canales Stage no estan habilitados: usa un canal de voz normal.",
+      );
       return;
     }
-
-    const url = this.normalizeUrl(rawUrl);
-    if (!url) {
-      await interaction.editReply(
-        "La URL configurada en `RADIO_STREAM_URL` es inválida. Debe ser http/https.",
-      ).catch(() => null);
-      return;
-    }
-
-    const member = interaction.member;
-    if (!(member instanceof GuildMember)) {
-      await interaction.editReply("No pude obtener tu estado de voz (intenta de nuevo).").catch(() => null);
-      return;
-    }
-
-    const voiceChannel = member.voice.channel;
-    if (!voiceChannel) {
-      await interaction.editReply(
-        "Primero entra a un canal de voz y luego usa `/play`.",
-      ).catch(() => null);
-      return;
-    }
-
-    if (
-      voiceChannel.type !== ChannelType.GuildVoice &&
-      voiceChannel.type !== ChannelType.GuildStageVoice
-    ) {
-      await interaction.editReply("Ese canal no es compatible para reproducir audio.").catch(() => null);
+    if (voiceChannel.type !== ChannelType.GuildVoice) {
+      await interaction.editReply("Ese canal no es compatible con la radio.");
       return;
     }
 
     const me = guild.members.me ?? (await guild.members.fetchMe().catch(() => null));
-    const perms = me ? voiceChannel.permissionsFor(me) : null;
-    if (!perms?.has(PermissionFlagsBits.Connect) || !perms.has(PermissionFlagsBits.Speak)) {
+    const permissions = me ? voiceChannel.permissionsFor(me) : null;
+    if (
+      !permissions?.has(PermissionFlagsBits.ViewChannel) ||
+      !permissions.has(PermissionFlagsBits.Connect) ||
+      !permissions.has(PermissionFlagsBits.Speak)
+    ) {
       await interaction.editReply(
-        "No tengo permisos para **Conectar** y **Hablar** en ese canal de voz.",
-      ).catch(() => null);
+        "Necesito permisos para **Ver**, **Conectar** y **Hablar** en ese canal.",
+      );
       return;
     }
 
-    const guildId = guild.id;
-    const existing = this.sessions.get(guildId);
+    let existing = this.sessions.get(guild.id);
+    if (existing?.stopping && existing.stopPromise) {
+      await existing.stopPromise;
+      existing = this.sessions.get(guild.id);
+    }
+    if (existing && !existing.stopping) {
+      if (existing.voiceChannelId === voiceChannel.id) {
+        existing.textChannelId = interaction.channelId;
+        await interaction.editReply(
+          existing.status === "playing"
+            ? `Ya estoy reproduciendo en **${voiceChannel.name}**.`
+            : `La sesion de **${voiceChannel.name}** esta ${this.statusLabel(existing.status).toLowerCase()}.`,
+        );
+        await this.publishPersistentNowPlaying(existing, true);
+        this.requestIdleRefresh(existing);
+        return;
+      }
 
-    // Verificar si la sesión existente sigue válida
-    const connectionDestroyed =
-      existing &&
-      existing.connection.state.status === VoiceConnectionStatus.Destroyed;
+      if (existing.voiceChannelId !== voiceChannel.id) {
+        const listenerCount = await this.humanListenerCount(existing);
+        const canMove = member.permissions.has(PermissionFlagsBits.MoveMembers);
+        if (listenerCount > 0 && !canMove) {
+          await interaction.editReply(
+            `Ya estoy reproduciendo en <#${existing.voiceChannelId}>. ` +
+              "Necesitas **Mover miembros** para trasladarme mientras haya oyentes.",
+          );
+          return;
+        }
+      }
 
-    const needsNewConnection =
-      !existing ||
-      existing.voiceChannelId !== voiceChannel.id ||
-      existing.stopping ||
-      connectionDestroyed;
-
-    if (existing && needsNewConnection) {
-      log("[play] deteniendo sesión anterior (destroyed:", connectionDestroyed, ")...");
-      await this.stop(guildId);
+      await this.stopSession(existing, "replaced");
     }
 
-    const session =
-      this.sessions.get(guildId) ??
-      this.createSession({
-        guildId,
-        voiceChannelId: voiceChannel.id,
-        textChannelId: interaction.channelId,
-        streamUrl: url,
-        adapterCreator: guild.voiceAdapterCreator,
+    await interaction.editReply(`Conectando a **${voiceChannel.name}**...`);
+    const session = this.createSession({
+      guildId: guild.id,
+      voiceChannelId: voiceChannel.id,
+      textChannelId: interaction.channelId,
+      adapterCreator: guild.voiceAdapterCreator,
+    });
+
+    try {
+      await this.ensurePlayback(session, "initial_start", true);
+      if (this.sessions.get(guild.id) !== session || session.status !== "playing") {
+        throw new Error("La sesion termino antes de iniciar la reproduccion");
+      }
+      await interaction.editReply(`Reproduciendo **${this.config.stationName}** en **${voiceChannel.name}**.`);
+      await this.publishPersistentNowPlaying(session, true);
+      this.requestIdleRefresh(session);
+    } catch (error) {
+      logger.error("play.failed", { ...sessionContext(session), error: errorMessage(error) });
+      await interaction.editReply(`No pude iniciar la radio: ${errorMessage(error)}`).catch(() => null);
+    }
+  }
+
+  public async stop(interaction: ChatInputCommandInteraction): Promise<void> {
+    const guild = interaction.guild;
+    if (!guild) {
+      await interaction.reply({ content: "Este comando solo funciona en un servidor.", ephemeral: true });
+      return;
+    }
+    const session = this.sessions.get(guild.id);
+    if (!session || session.stopping) {
+      await interaction.reply({ content: "No hay una radio activa en este servidor.", ephemeral: true });
+      return;
+    }
+    const member = await this.resolveMember(interaction);
+    const sameChannel = member?.voice.channelId === session.voiceChannelId;
+    const canMove = member?.permissions.has(PermissionFlagsBits.MoveMembers) ?? false;
+    if (!sameChannel && !canMove) {
+      await interaction.reply({
+        content: "Debes estar en mi canal de voz o tener **Mover miembros** para detenerme.",
+        ephemeral: true,
       });
+      return;
+    }
+    await interaction.deferReply();
+    await this.stopSession(session, "command");
+    await interaction.editReply("Radio detenida. Hasta pronto.");
+  }
 
-    // Actualiza contexto (por si ejecutan /play desde otro canal de texto)
-    session.textChannelId = interaction.channelId;
-    session.voiceChannelId = voiceChannel.id;
-    session.streamUrl = url;
-    session.stopping = false;
-    session.restartAttempts = 0;
+  public async nowPlaying(interaction: ChatInputCommandInteraction): Promise<void> {
+    const session = interaction.guildId ? this.sessions.get(interaction.guildId) : undefined;
+    if (!session || session.stopping) {
+      await interaction.reply({ content: "No hay una radio activa en este servidor.", ephemeral: true });
+      return;
+    }
+    await interaction.reply({ embeds: [await this.buildNowPlayingEmbed(session)] });
+  }
 
-    await interaction.editReply(
-      `Reproduciendo en **${voiceChannel.name}**.`,
-    ).catch(() => null);
-
-    await this.startOrReplaceStream(session);
-    await this.refreshIdleTimer(session);
+  public async status(interaction: ChatInputCommandInteraction): Promise<void> {
+    const session = interaction.guildId ? this.sessions.get(interaction.guildId) : undefined;
+    if (!session || session.stopping) {
+      await interaction.reply({ content: "No hay una radio activa en este servidor.", ephemeral: true });
+      return;
+    }
+    const listeners = await this.humanListenerCount(session);
+    const uptimeMs = Date.now() - session.createdAt;
+    const ping = session.connection.ping;
+    const embed = new EmbedBuilder()
+      .setColor(session.status === "playing" ? 0x2ecc71 : 0xf39c12)
+      .setTitle(`Estado — ${session.stationName}`)
+      .addFields(
+        { name: "Estado", value: this.statusLabel(session.status), inline: true },
+        { name: "Canal", value: `<#${session.voiceChannelId}>`, inline: true },
+        { name: "Oyentes", value: String(listeners), inline: true },
+        { name: "Uptime", value: this.formatDuration(uptimeMs), inline: true },
+        { name: "Ping voz", value: `WS ${ping.ws ?? "—"} ms / UDP ${ping.udp ?? "—"} ms`, inline: true },
+        { name: "Reintentos", value: String(session.totalRetries), inline: true },
+        { name: "Metadata", value: session.metadataSource?.toUpperCase() ?? "No disponible", inline: true },
+        { name: "Ultimo audio", value: session.lastAudioAt ? `<t:${Math.floor(session.lastAudioAt / 1000)}:R>` : "—", inline: true },
+      )
+      .setTimestamp();
+    if (session.lastError) embed.addFields({ name: "Ultimo error", value: session.lastError.slice(0, 1024) });
+    await interaction.reply({ embeds: [embed] });
   }
 
   public onVoiceStateUpdate(oldState: VoiceState, newState: VoiceState): void {
-    const guildId = newState.guild.id;
-    const session = this.sessions.get(guildId);
+    const session = this.sessions.get(newState.guild.id);
     if (!session || session.stopping) return;
-
-    const touchedChannelId = oldState.channelId ?? newState.channelId;
-    if (!touchedChannelId) return;
-
-    if (touchedChannelId !== session.voiceChannelId) return;
-    void this.refreshIdleTimer(session);
+    if (
+      oldState.channelId === session.voiceChannelId ||
+      newState.channelId === session.voiceChannelId
+    ) {
+      this.requestIdleRefresh(session);
+    }
   }
 
   public async shutdown(): Promise<void> {
-    const guildIds = [...this.sessions.keys()];
-    await Promise.all(guildIds.map((id) => this.stop(id)));
+    if (this.presenceTimer) clearTimeout(this.presenceTimer);
+    await Promise.all([...this.sessions.values()].map((session) => this.stopSession(session, "shutdown")));
+  }
+
+  private async defer(interaction: ChatInputCommandInteraction): Promise<boolean> {
+    try {
+      await interaction.deferReply();
+      return true;
+    } catch (error) {
+      logger.warn("interaction.defer_failed", {
+        guildId: interaction.guildId,
+        userId: interaction.user.id,
+        error: errorMessage(error),
+      });
+      return false;
+    }
+  }
+
+  private async resolveMember(interaction: ChatInputCommandInteraction): Promise<GuildMember | null> {
+    if (!interaction.guild) return null;
+    if (interaction.member instanceof GuildMember) return interaction.member;
+    return interaction.guild.members.fetch(interaction.user.id).catch(() => null);
   }
 
   private createSession(params: {
     guildId: string;
     voiceChannelId: string;
     textChannelId: string;
-    streamUrl: string;
-    adapterCreator: unknown;
+    adapterCreator: DiscordGatewayAdapterCreator;
   }): GuildSession {
-    log("[createSession] uniendo a canal de voz:", params.voiceChannelId);
-
     const connection = joinVoiceChannel({
       channelId: params.voiceChannelId,
       guildId: params.guildId,
-      adapterCreator: params.adapterCreator as never,
+      adapterCreator: params.adapterCreator,
       selfDeaf: true,
     });
-
-    const player = createAudioPlayer({
-      behaviors: { noSubscriber: NoSubscriberBehavior.Play },
-    });
-
+    const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
     connection.subscribe(player);
 
     const session: GuildSession = {
+      id: randomUUID(),
       guildId: params.guildId,
       voiceChannelId: params.voiceChannelId,
       textChannelId: params.textChannelId,
-      streamUrl: params.streamUrl,
+      streamUrl: this.config.streamUrl,
+      createdAt: Date.now(),
+      playbackStartedAt: null,
+      status: "connecting",
       connection,
       player,
+      streamGeneration: 0,
       currentTitle: null,
-      restartAttempts: 0,
-      lastRetryNoticeAt: 0,
+      stationName: this.config.stationName,
+      metadataSource: null,
+      metadataUpdatedAt: 0,
+      idleGeneration: 0,
+      idleRefreshRequested: false,
+      consecutiveFailures: 0,
+      totalRetries: 0,
+      lastError: null,
+      lastAudioAt: null,
       stopping: false,
     };
-
-    const networkStateChangeHandler = (
-      _oldNetworkState: unknown,
-      newNetworkState: unknown,
-    ) => {
-      const udp = Reflect.get(
-        newNetworkState as Record<string, unknown>,
-        "udp",
-      ) as { keepAliveInterval?: NodeJS.Timeout } | undefined;
-
-      if (udp?.keepAliveInterval) {
-        clearInterval(udp.keepAliveInterval);
-      }
-    };
-
-    // Escuchar cambios de estado de la conexión
-    connection.on("stateChange", (oldState, newState) => {
-      const oldNetworking = Reflect.get(
-        oldState as unknown as Record<string, unknown>,
-        "networking",
-      ) as VoiceNetworkingEmitter | undefined;
-      const newNetworking = Reflect.get(
-        newState as unknown as Record<string, unknown>,
-        "networking",
-      ) as VoiceNetworkingEmitter | undefined;
-
-      oldNetworking?.off?.("stateChange", networkStateChangeHandler);
-      newNetworking?.on?.("stateChange", networkStateChangeHandler);
-
-      log("[connection] stateChange:", oldState.status, "->", newState.status);
-
-      if (
-        oldState.status === VoiceConnectionStatus.Ready &&
-        newState.status === VoiceConnectionStatus.Connecting
-      ) {
-        log("[connection] Ready -> Connecting, forzando reconfiguración...");
-        this.forceConfigureNetworking(connection);
-      }
-
-      // Si la conexión fue destruida externamente (ej: alguien desconectó al bot)
-      if (newState.status === VoiceConnectionStatus.Destroyed) {
-        log("[connection] conexión destruida externamente, limpiando sesión...");
-        if (!session.stopping) {
-          session.stopping = true;
-          this.closeIcy(session);
-          this.sessions.delete(params.guildId);
-          this.syncPresence();
-        }
-      }
-
-      // Si se desconectó, intentar reconectar o limpiar
-      if (newState.status === VoiceConnectionStatus.Disconnected) {
-        log("[connection] desconectado, verificando si es recuperable...");
-
-        // Intentar reconectar si es posible
-        Promise.race([
-          new Promise<boolean>((resolve) => {
-            // Esperar a que vuelva a Ready o se destruya
-            const onStateChange = (
-              _: { status: VoiceConnectionStatus },
-              ns: { status: VoiceConnectionStatus },
-            ) => {
-              if (ns.status === VoiceConnectionStatus.Ready) {
-                connection.off("stateChange", onStateChange);
-                resolve(true);
-              } else if (ns.status === VoiceConnectionStatus.Destroyed) {
-                connection.off("stateChange", onStateChange);
-                resolve(false);
-              }
-            };
-            connection.on("stateChange", onStateChange);
-          }),
-          new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 5_000)),
-        ]).then((recovered) => {
-          if (!recovered && !session.stopping) {
-            log("[connection] no se pudo reconectar, limpiando sesión...");
-            void this.stop(params.guildId);
-          }
-        });
-      }
-    });
-
-    connection.on("error", (err) => {
-      log("[connection] error:", err.message);
-    });
-
-    player.on("error", (err) => {
-      log("[player] error:", err.message);
-      void this.handleStreamFailure(session, `Error de reproducción: ${err.message}`);
-    });
-
-    player.on("stateChange", (oldState, newState) => {
-      log("[player] stateChange:", oldState.status, "->", newState.status);
-      if (session.stopping) return;
-      if (
-        oldState.status !== AudioPlayerStatus.Idle &&
-        newState.status === AudioPlayerStatus.Idle
-      ) {
-        void this.handleStreamFailure(session, "El stream se detuvo/terminó.");
-      }
-    });
-
     this.sessions.set(params.guildId, session);
+    this.attachConnectionEvents(session);
+    this.attachPlayerEvents(session);
+    logger.info("session.created", sessionContext(session));
     return session;
   }
 
-  private async waitForConnectionReady(
-    connection: VoiceConnection,
-    timeoutMs: number,
-  ): Promise<boolean> {
-    if (connection.state.status === VoiceConnectionStatus.Ready) {
-      log("[waitForConnectionReady] ya está Ready");
-      return true;
-    }
-
-    if (connection.state.status === VoiceConnectionStatus.Destroyed) {
-      log("[waitForConnectionReady] conexión destruida");
-      return false;
-    }
-
-    const startedAt = Date.now();
-    let rejoinAttempts = 0;
-
-    while (Date.now() - startedAt < timeoutMs) {
-      const elapsed = Date.now() - startedAt;
-      const remaining = timeoutMs - elapsed;
-      const waitWindow = Math.min(READY_REJOIN_WINDOW_MS, remaining);
-
-      try {
-        await entersState(connection, VoiceConnectionStatus.Ready, waitWindow);
-        log("[waitForConnectionReady] estado Ready");
-        return true;
-      } catch {
-        const status = connection.state.status;
-
-        if (rejoinAttempts >= READY_MAX_REJOINS) {
-          break;
-        }
-
-        rejoinAttempts += 1;
-        log(`[waitForConnectionReady] rejoin ${rejoinAttempts}/${READY_MAX_REJOINS} (estado: ${status})`);
-
-        try {
-          connection.rejoin();
-          this.forceConfigureNetworking(connection);
-        } catch (err) {
-          log("[waitForConnectionReady] error en rejoin:", err instanceof Error ? err.message : String(err));
-          return false;
-        }
-      }
-    }
-
-    log("[waitForConnectionReady] timeout esperando Ready");
-    return false;
-  }
-
-  private forceConfigureNetworking(connection: VoiceConnection): void {
-    try {
-      const maybeConfigure = Reflect.get(
-        connection as unknown as Record<string, unknown>,
-        "configureNetworking",
-      );
-      if (typeof maybeConfigure === "function") {
-        maybeConfigure.call(connection);
-      }
-    } catch (err) {
-      log("[forceConfigureNetworking] error:", err instanceof Error ? err.message : String(err));
-    }
-  }
-
-  private async startOrReplaceStream(session: GuildSession): Promise<void> {
-    log("[startOrReplaceStream] iniciando...");
-    this.closeIcy(session);
-
-    // Esperar a que la conexión de voz esté lista
-    const ready = await this.waitForConnectionReady(session.connection, 30_000);
-    if (!ready) {
-      log("[startOrReplaceStream] conexión no llegó a Ready");
-      await this.sendText(
-        session,
-        "No pude conectar al canal de voz (timeout). Intenta de nuevo.",
-      );
-      await this.stop(session.guildId);
-      return;
-    }
-
-    log("[startOrReplaceStream] conexión Ready, abriendo stream...");
-
-    let icyHandle: IcyHandle;
-    try {
-      icyHandle = await this.openIcyStream(session.streamUrl);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      log("[startOrReplaceStream] error abriendo stream:", msg);
-      await this.sendText(session, `No pude abrir el stream: ${msg}`);
-      await this.stop(session.guildId);
-      return;
-    }
-
-    session.icy = icyHandle;
-    log("[startOrReplaceStream] stream abierto, configurando metadata listener...");
-
-    // Metadata ICY (si existe demuxer)
-    if (icyHandle.demuxer) {
-      icyHandle.demuxer.on("metadata", (metadata: Buffer) => {
-        try {
-          const parsed = icy.parse(metadata);
-          const title = (parsed.StreamTitle ?? "").trim();
-          if (!title) return;
-          if (title === session.currentTitle) return;
-          log("[metadata] título:", title);
-          session.currentTitle = title;
-          this.setPresenceThrottled(title);
-        } catch (e) {
-          log("[metadata] error parseando:", e);
-        }
+  private attachConnectionEvents(session: GuildSession): void {
+    session.connection.on("stateChange", (oldState, newState) => {
+      logger.info("voice.state_changed", {
+        ...sessionContext(session),
+        previousState: oldState.status,
+        nextState: newState.status,
       });
-    }
-
-    log("[startOrReplaceStream] creando AudioResource...");
-
-    const audioPassThrough = new PassThrough({ highWaterMark: AUDIO_HIGH_WATER_MARK });
-
-    icyHandle.audioStream.on("error", (err) => {
-      log("[audioStream] error:", err.message);
-      audioPassThrough.destroy(err);
+      if (session.stopping || this.sessions.get(session.guildId) !== session) return;
+      if (newState.status === VoiceConnectionStatus.Destroyed) {
+        void this.stopSession(session, "connection_destroyed");
+      } else if (newState.status === VoiceConnectionStatus.Disconnected) {
+        void this.ensurePlayback(session, "voice_disconnected", false).catch(() => null);
+      }
     });
-
-    icyHandle.audioStream.on("close", () => {
-      log("[audioStream] close");
+    session.connection.on("error", (error) => {
+      logger.error("voice.error", { ...sessionContext(session), error: error.message });
     });
-
-    icyHandle.audioStream.on("end", () => {
-      log("[audioStream] end");
-      audioPassThrough.end();
-    });
-
-    icyHandle.audioStream.pipe(audioPassThrough);
-
-    const resource = createAudioResource(audioPassThrough, {
-      inputType: StreamType.Arbitrary,
-    });
-
-    log("[startOrReplaceStream] reproduciendo...");
-    session.player.play(resource);
-
-    // Presencia base si no llega metadata
-    if (!session.currentTitle) {
-      this.setPresenceThrottled("Radio");
-    }
   }
 
-  private async handleStreamFailure(
+  private attachPlayerEvents(session: GuildSession): void {
+    session.player.on("error", (error) => {
+      this.requestRecovery(session, `Error del reproductor: ${error.message}`);
+    });
+    session.player.on("stateChange", (oldState, newState) => {
+      logger.info("player.state_changed", {
+        ...sessionContext(session),
+        previousState: oldState.status,
+        nextState: newState.status,
+      });
+      if (
+        !session.stopping &&
+        oldState.status !== AudioPlayerStatus.Idle &&
+        newState.status === AudioPlayerStatus.Idle
+      ) {
+        this.requestRecovery(session, "El stream termino o dejo de entregar audio");
+      }
+    });
+  }
+
+  private requestRecovery(session: GuildSession, reason: string): void {
+    if (session.stopping || this.sessions.get(session.guildId) !== session) return;
+    if (session.recoveryPromise) return;
+    this.streamFailures += 1;
+    session.lastError = reason;
+    logger.warn("stream.failure", { ...sessionContext(session), reason });
+    void this.ensurePlayback(session, reason, false).catch((error) => {
+      logger.error("stream.recovery_failed", {
+        ...sessionContext(session),
+        error: errorMessage(error),
+      });
+    });
+  }
+
+  private async ensurePlayback(
     session: GuildSession,
     reason: string,
+    initial: boolean,
   ): Promise<void> {
-    if (session.stopping) return;
-
-    const maxRetries = 5;
-    session.restartAttempts += 1;
-
-    log("[handleStreamFailure]", reason, `intento ${session.restartAttempts}/${maxRetries}`);
-
-    const now = Date.now();
-    if (now - session.lastRetryNoticeAt > 15_000) {
-      session.lastRetryNoticeAt = now;
-      await this.sendText(
-        session,
-        `${reason}\nReintentando (${session.restartAttempts}/${maxRetries})...`,
-      );
+    if (session.recoveryPromise) return session.recoveryPromise;
+    const recovery = this.recoverSession(session, reason, initial);
+    session.recoveryPromise = recovery;
+    try {
+      await recovery;
+    } finally {
+      if (session.recoveryPromise === recovery) {
+        session.recoveryPromise = undefined;
+        if (
+          !session.stopping &&
+          session.status === "playing" &&
+          session.player.state.status === AudioPlayerStatus.Idle
+        ) {
+          this.requestRecovery(session, "El stream termino inmediatamente despues de iniciar");
+        }
+      }
     }
-
-    if (session.restartAttempts >= maxRetries) {
-      await this.sendText(
-        session,
-        "No pude mantener el stream activo. Me desconecto.",
-      );
-      await this.stop(session.guildId);
-      return;
-    }
-
-    await new Promise((r) => setTimeout(r, 3_000));
-    await this.startOrReplaceStream(session);
   }
 
-  private openIcyStream(url: string, redirectDepth = 0): Promise<IcyHandle> {
-    log("[openIcyStream] abriendo:", url, "redirect depth:", redirectDepth);
+  private async recoverSession(session: GuildSession, reason: string, initial: boolean): Promise<void> {
+    let lastError = reason;
+    for (let attempt = 1; attempt <= MAX_START_ATTEMPTS; attempt += 1) {
+      if (session.stopping || this.sessions.get(session.guildId) !== session) {
+        throw new Error("La sesion ya no esta activa");
+      }
+      if (attempt > 1 || !initial) {
+        session.status = "reconnecting";
+        session.totalRetries += 1;
+        this.totalRetries += 1;
+        const delayMs = Math.min(30_000, 1_500 * 2 ** Math.min(attempt - 1, 4));
+        const jitterMs = Math.floor(Math.random() * 750);
+        await this.sendText(
+          session,
+          `La radio perdio la conexion. Reintentando (${attempt}/${MAX_START_ATTEMPTS})...`,
+        );
+        await new Promise((resolve) => setTimeout(resolve, delayMs + jitterMs));
+      } else {
+        session.status = "connecting";
+      }
 
-    return new Promise((resolve, reject) => {
-      let parsedUrl: URL;
       try {
-        parsedUrl = new URL(url);
+        await this.ensureConnectionReady(session);
+        await this.startStream(session);
+        session.status = "playing";
+        session.playbackStartedAt = Date.now();
+        session.consecutiveFailures = 0;
+        session.lastError = null;
+        logger.info("stream.playing", { ...sessionContext(session), attempt });
+        this.schedulePersistentNowPlayingUpdate(session);
+        return;
+      } catch (error) {
+        lastError = errorMessage(error);
+        session.lastError = lastError;
+        session.consecutiveFailures += 1;
+        logger.warn("stream.start_attempt_failed", {
+          ...sessionContext(session),
+          attempt,
+          error: lastError,
+        });
+        this.closeStream(session);
+      }
+    }
+
+    await this.sendText(session, "No pude mantener la radio activa y me desconectare.");
+    await this.stopSession(session, "retries_exhausted");
+    throw new Error(lastError);
+  }
+
+  private async ensureConnectionReady(session: GuildSession): Promise<void> {
+    if (this.connectionIsDestroyed(session.connection)) {
+      throw new Error("La conexion de voz fue destruida");
+    }
+    if (session.connection.state.status === VoiceConnectionStatus.Ready) return;
+
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      if (
+        session.connection.state.status === VoiceConnectionStatus.Disconnected ||
+        attempt > 1
+      ) {
+        const accepted = session.connection.rejoin();
+        if (!accepted) throw new Error("Discord rechazo el reingreso al canal de voz");
+      }
+      try {
+        await entersState(
+          session.connection,
+          VoiceConnectionStatus.Ready,
+          CONNECTION_READY_TIMEOUT_MS,
+        );
+        return;
       } catch {
-        reject(new Error("URL inválida"));
-        return;
+        if (this.connectionIsDestroyed(session.connection)) break;
       }
-
-      const protocol = parsedUrl.protocol;
-      if (protocol !== "http:" && protocol !== "https:") {
-        reject(new Error(`Protocolo no soportado: ${protocol}`));
-        return;
-      }
-
-      const lib = protocol === "https:" ? https : http;
-      let settled = false;
-
-      const req = lib.get(
-        parsedUrl,
-        {
-          headers: {
-            "User-Agent": "monkey-bot/0.1 (discord radio bot)",
-            "Icy-MetaData": "1",
-            Accept: "*/*",
-          },
-        },
-        (res: IncomingMessage) => {
-          const status = res.statusCode ?? 0;
-          log("[openIcyStream] respuesta status:", status);
-
-          // Redirects comunes
-          if (
-            [301, 302, 303, 307, 308].includes(status) &&
-            typeof res.headers.location === "string"
-          ) {
-            if (redirectDepth >= MAX_REDIRECTS) {
-              res.resume();
-              res.destroy();
-              if (!settled) {
-                settled = true;
-                reject(new Error("Demasiados redirects abriendo el stream"));
-              }
-              return;
-            }
-
-            const nextUrl = new URL(res.headers.location, parsedUrl).toString();
-            log("[openIcyStream] siguiendo redirect a:", nextUrl);
-            res.resume();
-            res.destroy();
-            this.openIcyStream(nextUrl, redirectDepth + 1).then(resolve, reject);
-            return;
-          }
-
-          if (status < 200 || status >= 300) {
-            res.resume();
-            res.destroy();
-            if (!settled) {
-              settled = true;
-              reject(new Error(`HTTP ${status}`));
-            }
-            return;
-          }
-
-          // Leer headers ICY
-          const metaintRaw = res.headers["icy-metaint"];
-          const metaintStr = Array.isArray(metaintRaw) ? metaintRaw[0] : metaintRaw;
-          const metaint = Number.parseInt(String(metaintStr ?? ""), 10);
-
-          log("[openIcyStream] icy-metaint:", metaintRaw, "->", metaint);
-          log("[openIcyStream] content-type:", res.headers["content-type"]);
-
-          if (Number.isFinite(metaint) && metaint > 0) {
-            const demuxer = new IcyDemuxer(metaint);
-
-            res.on("error", (err) => {
-              log("[openIcyStream] res error:", err.message);
-              demuxer.destroy(err);
-            });
-
-            res.pipe(demuxer);
-
-            if (!settled) {
-              settled = true;
-              resolve({ req, res, audioStream: demuxer, demuxer });
-            }
-            return;
-          }
-
-          // Si el server no entrega icy-metaint, reproducimos sin metadata
-          log("[openIcyStream] sin icy-metaint, reproduciendo sin metadata");
-          if (!settled) {
-            settled = true;
-            resolve({ req, res, audioStream: res, demuxer: null });
-          }
-        },
-      );
-
-      const timeout = setTimeout(() => {
-        log("[openIcyStream] timeout!");
-        if (!settled) {
-          settled = true;
-          req.destroy();
-          reject(new Error("Timeout abriendo stream"));
-        }
-      }, STREAM_OPEN_TIMEOUT_MS);
-
-      req.on("error", (err) => {
-        log("[openIcyStream] req error:", err.message);
-        clearTimeout(timeout);
-        if (!settled) {
-          settled = true;
-          reject(err);
-        }
-      });
-
-      req.on("response", () => {
-        clearTimeout(timeout);
-      });
-    });
+    }
+    throw new Error("Timeout esperando la conexion de voz");
   }
 
-  private closeIcy(session: GuildSession): void {
-    const handle = session.icy;
-    session.icy = undefined;
-    if (!handle) return;
-
-    log("[closeIcy] cerrando stream...");
-
-    try {
-      handle.audioStream.removeAllListeners();
-      handle.audioStream.destroy();
-    } catch {
-      // ignore
-    }
-    try {
-      handle.res.removeAllListeners();
-      handle.res.destroy();
-    } catch {
-      // ignore
-    }
-    try {
+  private async startStream(session: GuildSession): Promise<void> {
+    this.closeStream(session);
+    const generation = ++session.streamGeneration;
+    const handle = await this.openIcyStream(session.streamUrl);
+    if (session.stopping || generation !== session.streamGeneration) {
       handle.req.destroy();
-    } catch {
-      // ignore
+      handle.res.destroy();
+      handle.audioStream.destroy();
+      throw new Error("El inicio del stream fue reemplazado");
     }
-  }
+    session.icy = handle;
+    session.lastAudioAt = Date.now();
+    session.stationName = headerValue(handle.res.headers["icy-name"]) ?? this.config.stationName;
 
-  private async refreshIdleTimer(session: GuildSession): Promise<void> {
-    const guild = this.client.guilds.cache.get(session.guildId);
-    if (!guild) return;
+    if (handle.demuxer) {
+      handle.demuxer.on("metadata", (metadata: Buffer) => {
+        if (generation !== session.streamGeneration || session.stopping) return;
+        try {
+          const title = parseIcyMetadata(metadata);
+          if (title) this.handleMetadata(session, title, "icy");
+        } catch (error) {
+          logger.warn("metadata.icy_parse_failed", {
+            ...sessionContext(session),
+            error: errorMessage(error),
+          });
+        }
+      });
+    }
 
-    const channel = await guild.channels
-      .fetch(session.voiceChannelId)
-      .catch(() => null);
+    if (this.config.metadataUrl) this.startMetadataPolling(session, generation);
 
-    if (!channel || !channel.isVoiceBased()) return;
+    const passThrough = new PassThrough({ highWaterMark: AUDIO_HIGH_WATER_MARK });
+    passThrough.on("data", () => {
+      if (generation === session.streamGeneration) session.lastAudioAt = Date.now();
+    });
+    const fail = (error: Error) => {
+      if (generation !== session.streamGeneration || session.stopping) return;
+      passThrough.destroy(error);
+      this.requestRecovery(session, `Fallo del stream HTTP: ${error.message}`);
+    };
+    handle.audioStream.on("error", fail);
+    handle.res.on("aborted", () => fail(new Error("Respuesta HTTP abortada")));
+    handle.audioStream.pipe(passThrough);
 
-    const listeners = channel.members.filter((m) => !m.user.bot).size;
-    const isEmpty = listeners === 0;
-
-    if (!isEmpty) {
-      if (session.idleTimer) {
-        clearTimeout(session.idleTimer);
-        session.idleTimer = undefined;
+    session.watchdogTimer = setInterval(() => {
+      if (
+        generation === session.streamGeneration &&
+        session.lastAudioAt &&
+        Date.now() - session.lastAudioAt > STREAM_STALL_TIMEOUT_MS
+      ) {
+        fail(new Error("El stream no entrego audio durante 45 segundos"));
       }
+    }, STREAM_WATCHDOG_INTERVAL_MS);
+
+    const resource = createAudioResource(passThrough, { inputType: StreamType.Arbitrary });
+    session.player.play(resource);
+    await entersState(session.player, AudioPlayerStatus.Playing, PLAYER_START_TIMEOUT_MS);
+  }
+
+  private startMetadataPolling(session: GuildSession, generation: number): void {
+    if (session.metadataTimer) clearInterval(session.metadataTimer);
+    const poll = async () => {
+      if (session.stopping || generation !== session.streamGeneration || !this.config.metadataUrl) return;
+      const icyIsFresh =
+        session.metadataSource === "icy" &&
+        Date.now() - session.metadataUpdatedAt < this.config.metadataPollSeconds * 2_000;
+      if (icyIsFresh) return;
+      try {
+        const response = await fetch(this.config.metadataUrl, {
+          headers: { Accept: "application/json", "User-Agent": "monkey-bot/0.2" },
+          signal: AbortSignal.timeout(10_000),
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const body = await response.text();
+        if (body.length > 1_000_000) throw new Error("La respuesta de metadata supera 1 MB");
+        const payload: unknown = JSON.parse(body);
+        const title = extractMetadataTitle(
+          payload,
+          this.config.metadataTitlePath,
+          this.config.metadataArtistPath,
+        );
+        if (title) this.handleMetadata(session, title, "json");
+      } catch (error) {
+        logger.warn("metadata.poll_failed", {
+          ...sessionContext(session),
+          error: errorMessage(error),
+        });
+      }
+    };
+    void poll();
+    session.metadataTimer = setInterval(() => void poll(), this.config.metadataPollSeconds * 1000);
+  }
+
+  private handleMetadata(session: GuildSession, rawTitle: string, source: Exclude<MetadataSource, null>): void {
+    const title = rawTitle.replace(/\0/g, "").trim().slice(0, 300);
+    if (!title || title === session.currentTitle) return;
+    session.currentTitle = title;
+    session.metadataSource = source;
+    session.metadataUpdatedAt = Date.now();
+    this.metadataUpdates += 1;
+    logger.info("metadata.updated", { ...sessionContext(session), source, title });
+    this.schedulePresence(title);
+    this.schedulePersistentNowPlayingUpdate(session);
+  }
+
+  private schedulePresence(title: string): void {
+    this.pendingPresenceTitle = title;
+    const remaining = PRESENCE_UPDATE_INTERVAL_MS - (Date.now() - this.lastPresenceAt);
+    if (remaining <= 0) {
+      this.flushPresence();
       return;
     }
-
-    if (session.idleTimer) return;
-
-    const ms = Math.max(1, this.idleDisconnectMinutes) * 60_000;
-
-    await this.sendText(
-      session,
-      `No hay usuarios escuchando. Si nadie vuelve en ${this.idleDisconnectMinutes} min, me desconecto.`,
-    );
-
-    session.idleTimer = setTimeout(() => {
-      session.idleTimer = undefined;
-      void this.disconnectIfStillEmpty(session);
-    }, ms);
+    if (!this.presenceTimer) {
+      this.presenceTimer = setTimeout(() => {
+        this.presenceTimer = undefined;
+        this.flushPresence();
+      }, remaining);
+    }
   }
 
-  private async disconnectIfStillEmpty(session: GuildSession): Promise<void> {
-    if (session.stopping) return;
-    const guild = this.client.guilds.cache.get(session.guildId);
-    if (!guild) return;
-
-    const channel = await guild.channels
-      .fetch(session.voiceChannelId)
-      .catch(() => null);
-    if (!channel || !channel.isVoiceBased()) return;
-
-    const listeners = channel.members.filter((m) => !m.user.bot).size;
-    if (listeners > 0) return;
-
-    await this.sendText(session, "No hay usuarios escuchando, ¡hasta pronto!");
-    await this.stop(session.guildId);
-  }
-
-  private async stop(guildId: string): Promise<void> {
-    const session = this.sessions.get(guildId);
-    if (!session) return;
-
-    log("[stop] deteniendo sesión para guild:", guildId);
-    session.stopping = true;
-
-    if (session.idleTimer) {
-      clearTimeout(session.idleTimer);
-      session.idleTimer = undefined;
-    }
-
-    this.closeIcy(session);
-
-    try {
-      session.player.stop(true);
-    } catch {
-      // ignore
-    }
-
-    try {
-      session.connection.destroy();
-    } catch {
-      // ignore
-    }
-
-    this.sessions.delete(guildId);
-    this.syncPresence();
-  }
-
-  private async sendText(session: GuildSession, content: string): Promise<void> {
-    if (!session.textChannelId) return;
-    const channel =
-      this.client.channels.cache.get(session.textChannelId) ??
-      (await this.client.channels.fetch(session.textChannelId).catch(() => null));
-    if (!channel || !channel.isTextBased()) return;
-    if (typeof (channel as unknown as Partial<SendableChannel>).send !== "function") return;
-    await (channel as unknown as SendableChannel).send({ content }).catch(() => null);
-  }
-
-  private setPresenceThrottled(title: string): void {
-    const now = Date.now();
-    const normalized = title.trim();
-    if (!normalized) return;
-    if (this.lastPresenceTitle === normalized && now - this.lastPresenceAt < 30_000) {
-      return;
-    }
-    if (now - this.lastPresenceAt < 10_000) return;
-    this.lastPresenceAt = now;
-    this.lastPresenceTitle = normalized;
-
-    const name =
-      normalized.length > PRESENCE_TITLE_MAX
-        ? normalized.slice(0, PRESENCE_TITLE_MAX - 1) + "…"
-        : normalized;
-
-    log("[presence] actualizando a:", name);
-
+  private flushPresence(): void {
+    const title = this.pendingPresenceTitle?.trim();
+    if (!title || title === this.publishedPresenceTitle) return;
+    this.pendingPresenceTitle = null;
+    this.publishedPresenceTitle = title;
+    this.lastPresenceAt = Date.now();
     this.client.user?.setPresence({
-      activities: [{ name, type: ActivityType.Listening }],
+      activities: [{ name: title.slice(0, 128), type: ActivityType.Listening }],
       status: "online",
     });
   }
 
   private syncPresence(): void {
-    const anySession = [...this.sessions.values()].find(
-      (s) => !s.stopping && s.player.state.status === AudioPlayerStatus.Playing,
-    );
+    const active = [...this.sessions.values()]
+      .filter((session) => !session.stopping && session.currentTitle)
+      .sort((a, b) => b.metadataUpdatedAt - a.metadataUpdatedAt)[0];
+    if (active?.currentTitle) {
+      this.schedulePresence(active.currentTitle);
+      return;
+    }
+    this.pendingPresenceTitle = null;
+    this.publishedPresenceTitle = null;
+    this.client.user?.setPresence({
+      activities: [{ name: "usa /play", type: ActivityType.Playing }],
+      status: "online",
+    });
+  }
 
-    if (!anySession) {
-      this.lastPresenceTitle = null;
-      this.client.user?.setPresence({
-        activities: [{ name: "Mirando fandoms.io", type: ActivityType.Playing }],
-        status: "online",
+  private requestIdleRefresh(session: GuildSession): void {
+    if (session.stopping) return;
+    session.idleRefreshRequested = true;
+    if (session.idleRefreshPromise) return;
+    const task = (async () => {
+      while (session.idleRefreshRequested && !session.stopping) {
+        session.idleRefreshRequested = false;
+        await this.refreshIdleState(session);
+      }
+    })();
+    session.idleRefreshPromise = task;
+    void task.finally(() => {
+      if (session.idleRefreshPromise === task) session.idleRefreshPromise = undefined;
+      if (session.idleRefreshRequested) this.requestIdleRefresh(session);
+    });
+  }
+
+  private async refreshIdleState(session: GuildSession): Promise<void> {
+    const listeners = await this.humanListenerCount(session);
+    if (session.stopping || this.sessions.get(session.guildId) !== session) return;
+    if (listeners > 0) {
+      this.cancelIdleTimer(session);
+      return;
+    }
+    if (session.idleTimer) return;
+
+    const generation = ++session.idleGeneration;
+    session.idleTimer = setTimeout(() => {
+      if (session.idleGeneration !== generation) return;
+      session.idleTimer = undefined;
+      void this.disconnectIfStillEmpty(session, generation);
+    }, this.config.idleDisconnectMinutes * 60_000);
+    void this.sendText(
+      session,
+      `No hay usuarios escuchando. Me desconectare en ${this.config.idleDisconnectMinutes} min si nadie vuelve.`,
+    );
+  }
+
+  private cancelIdleTimer(session: GuildSession): void {
+    session.idleGeneration += 1;
+    if (session.idleTimer) clearTimeout(session.idleTimer);
+    session.idleTimer = undefined;
+  }
+
+  private async disconnectIfStillEmpty(session: GuildSession, generation: number): Promise<void> {
+    if (session.stopping || session.idleGeneration !== generation) return;
+    const listeners = await this.humanListenerCount(session);
+    if (listeners > 0) {
+      this.cancelIdleTimer(session);
+      return;
+    }
+    await this.sendText(session, "No hay usuarios escuchando. Hasta pronto.");
+    await this.stopSession(session, "idle_timeout");
+  }
+
+  private async humanListenerCount(session: GuildSession): Promise<number> {
+    const guild = this.client.guilds.cache.get(session.guildId);
+    if (!guild) return 0;
+    const channel =
+      guild.channels.cache.get(session.voiceChannelId) ??
+      (await guild.channels.fetch(session.voiceChannelId).catch(() => null));
+    if (!channel?.isVoiceBased()) return 0;
+    return channel.members.filter((member) => !member.user.bot).size;
+  }
+
+  private closeStream(session: GuildSession): void {
+    session.streamGeneration += 1;
+    if (session.watchdogTimer) clearInterval(session.watchdogTimer);
+    if (session.metadataTimer) clearInterval(session.metadataTimer);
+    session.watchdogTimer = undefined;
+    session.metadataTimer = undefined;
+    const handle = session.icy;
+    session.icy = undefined;
+    if (!handle) return;
+    try {
+      handle.res.unpipe();
+      handle.audioStream.destroy();
+      handle.res.destroy();
+      handle.req.destroy();
+    } catch (error) {
+      logger.warn("stream.close_failed", { ...sessionContext(session), error: errorMessage(error) });
+    }
+  }
+
+  private async stopSession(session: GuildSession, reason: string): Promise<void> {
+    if (session.stopPromise) return session.stopPromise;
+    const task = this.performStopSession(session, reason);
+    session.stopPromise = task;
+    try {
+      await task;
+    } finally {
+      if (session.stopPromise === task) session.stopPromise = undefined;
+    }
+  }
+
+  private async performStopSession(session: GuildSession, reason: string): Promise<void> {
+    session.stopping = true;
+    session.status = "stopping";
+    this.cancelIdleTimer(session);
+    this.closeStream(session);
+    if (session.nowPlayingUpdateTimer) clearTimeout(session.nowPlayingUpdateTimer);
+    logger.info("session.stopping", { ...sessionContext(session), reason });
+    try {
+      session.player.stop(true);
+    } catch {
+      // Already stopped.
+    }
+    try {
+      if (session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
+        session.connection.destroy();
+      }
+    } catch {
+      // Already destroyed.
+    }
+    await this.updatePersistentAsStopped(session, reason);
+    session.status = "stopped";
+    if (this.sessions.get(session.guildId) === session) this.sessions.delete(session.guildId);
+    this.syncPresence();
+    logger.info("session.stopped", { ...sessionContext(session), reason });
+  }
+
+  private async sendText(session: GuildSession, content: string): Promise<void> {
+    const channel = await this.getSendableChannel(session.textChannelId);
+    if (!channel) return;
+    await channel.send({ content, allowedMentions: { parse: [] } }).catch((error: unknown) => {
+      logger.warn("text.send_failed", { ...sessionContext(session), error: errorMessage(error) });
+    });
+  }
+
+  private async getSendableChannel(channelId: string): Promise<SendableChannel | null> {
+    const channel =
+      this.client.channels.cache.get(channelId) ??
+      (await this.client.channels.fetch(channelId).catch(() => null));
+    if (!channel || !("send" in channel) || typeof channel.send !== "function") return null;
+    return channel as unknown as SendableChannel;
+  }
+
+  private schedulePersistentNowPlayingUpdate(session: GuildSession): void {
+    if (!session.nowPlayingMessage || session.stopping || session.nowPlayingUpdateTimer) return;
+    session.nowPlayingUpdateTimer = setTimeout(() => {
+      session.nowPlayingUpdateTimer = undefined;
+      void this.publishPersistentNowPlaying(session, false);
+    }, 1_000);
+  }
+
+  private async publishPersistentNowPlaying(session: GuildSession, create: boolean): Promise<void> {
+    const embed = await this.buildNowPlayingEmbed(session);
+    if (session.nowPlayingMessage) {
+      await session.nowPlayingMessage.edit({ embeds: [embed] }).catch((error: unknown) => {
+        logger.warn("now_playing.edit_failed", { ...sessionContext(session), error: errorMessage(error) });
+        session.nowPlayingMessage = undefined;
       });
       return;
     }
-
-    if (anySession.currentTitle) {
-      this.setPresenceThrottled(anySession.currentTitle);
-      return;
-    }
-
-    this.setPresenceThrottled("Radio");
+    if (!create) return;
+    const channel = await this.getSendableChannel(session.textChannelId);
+    if (!channel) return;
+    session.nowPlayingMessage = await channel
+      .send({ embeds: [embed], allowedMentions: { parse: [] } })
+      .catch(() => undefined);
   }
 
-  private normalizeUrl(raw: string): string | null {
-    try {
-      const u = new URL(raw);
-      if (u.protocol !== "http:" && u.protocol !== "https:") return null;
-      return u.toString();
-    } catch {
-      return null;
-    }
+  private async buildNowPlayingEmbed(session: GuildSession): Promise<EmbedBuilder> {
+    const listeners = await this.humanListenerCount(session);
+    return new EmbedBuilder()
+      .setColor(session.status === "playing" ? 0x2ecc71 : 0xf39c12)
+      .setTitle(session.stationName)
+      .setDescription(session.currentTitle ? `🎵 **${session.currentTitle}**` : "Metadata no disponible")
+      .addFields(
+        { name: "Estado", value: this.statusLabel(session.status), inline: true },
+        { name: "Canal", value: `<#${session.voiceChannelId}>`, inline: true },
+        { name: "Oyentes", value: String(listeners), inline: true },
+      )
+      .setFooter({ text: session.metadataSource ? `Metadata: ${session.metadataSource.toUpperCase()}` : "Esperando metadata" })
+      .setTimestamp();
+  }
+
+  private async updatePersistentAsStopped(session: GuildSession, reason: string): Promise<void> {
+    if (!session.nowPlayingMessage) return;
+    const embed = new EmbedBuilder()
+      .setColor(0x95a5a6)
+      .setTitle(session.stationName)
+      .setDescription(session.currentTitle ? `Ultima cancion: **${session.currentTitle}**` : "Radio detenida")
+      .addFields({ name: "Estado", value: "Desconectada", inline: true })
+      .setFooter({ text: `Motivo: ${reason}` })
+      .setTimestamp();
+    await session.nowPlayingMessage.edit({ embeds: [embed] }).catch(() => null);
+  }
+
+  private openIcyStream(url: string, redirectDepth = 0): Promise<IcyHandle> {
+    return new Promise((resolve, reject) => {
+      const parsedUrl = new URL(url);
+      const lib = parsedUrl.protocol === "https:" ? https : http;
+      let settled = false;
+      const request = lib.get(
+        parsedUrl,
+        {
+          headers: {
+            "User-Agent": "monkey-bot/0.2",
+            "Icy-MetaData": "1",
+            Accept: "audio/*,*/*;q=0.8",
+          },
+        },
+        (response) => {
+          clearTimeout(openTimeout);
+          const status = response.statusCode ?? 0;
+          const location = headerValue(response.headers.location);
+          if ([301, 302, 303, 307, 308].includes(status) && location) {
+            response.resume();
+            response.destroy();
+            if (redirectDepth >= MAX_REDIRECTS) {
+              settled = true;
+              reject(new Error("Demasiadas redirecciones en el stream"));
+              return;
+            }
+            let nextUrl: string;
+            try {
+              nextUrl = new URL(location, parsedUrl).toString();
+            } catch {
+              settled = true;
+              reject(new Error("El stream respondio con una redireccion invalida"));
+              return;
+            }
+            settled = true;
+            this.openIcyStream(nextUrl, redirectDepth + 1).then(resolve, reject);
+            return;
+          }
+          if (status < 200 || status >= 300) {
+            response.resume();
+            response.destroy();
+            settled = true;
+            reject(new Error(`El stream respondio HTTP ${status}`));
+            return;
+          }
+
+          const metaint = Number.parseInt(headerValue(response.headers["icy-metaint"]) ?? "", 10);
+          if (Number.isFinite(metaint) && metaint > 0) {
+            const demuxer = new IcyDemuxer(metaint);
+            response.on("error", (error) => demuxer.destroy(error));
+            response.pipe(demuxer);
+            settled = true;
+            resolve({ req: request, res: response, audioStream: demuxer, demuxer });
+          } else {
+            settled = true;
+            resolve({ req: request, res: response, audioStream: response, demuxer: null });
+          }
+        },
+      );
+      const openTimeout = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        request.destroy();
+        reject(new Error("Timeout abriendo el stream"));
+      }, STREAM_OPEN_TIMEOUT_MS);
+      request.on("error", (error) => {
+        clearTimeout(openTimeout);
+        if (settled) return;
+        settled = true;
+        reject(error);
+      });
+    });
+  }
+
+  private statusLabel(status: SessionStatus): string {
+    return {
+      connecting: "Conectando",
+      playing: "Reproduciendo",
+      reconnecting: "Reconectando",
+      stopping: "Desconectando",
+      stopped: "Desconectada",
+    }[status];
+  }
+
+  private connectionIsDestroyed(connection: VoiceConnection): boolean {
+    return connection.state.status === VoiceConnectionStatus.Destroyed;
+  }
+
+  private formatDuration(milliseconds: number): string {
+    const seconds = Math.floor(milliseconds / 1000);
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const remainder = seconds % 60;
+    return `${hours}h ${minutes}m ${remainder}s`;
   }
 }
